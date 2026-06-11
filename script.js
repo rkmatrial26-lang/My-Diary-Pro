@@ -3,14 +3,6 @@
  * ============================================
  * Premium single-page diary with Firebase Auth + Firestore sync,
  * local storage fallback, and a full-featured editor modal.
- *
- * Architecture:
- *  - FirebaseService   : Auth + Firestore CRUD operations
- *  - StorageService    : localStorage layer (offline)
- *  - NoteEngine        : Note lifecycle, transforms, filters
- *  - UIController      : DOM manipulation, rendering, animations
- *  - EditorController  : Modal editor, auto-save, word count
- *  - AppController     : Orchestrates all modules
  */
 
 'use strict';
@@ -40,23 +32,20 @@ const APP_CONFIG = {
 };
 
 /* Filter IDs */
-const FILTERS = { ALL: 'all', PINNED: 'pinned', FAVORITES: 'favorites', TRASH: 'trash' };
+const FILTERS = { ALL: 'all', PINNED: 'pinned', FAVORITES: 'favorites', TRASH: 'trash', THIS_WEEK: 'this-week', THIS_MONTH: 'this-month', DATE: 'date' };
 
 /* ═══════════════════════════════════════════════════════════
    2. UTILITY FUNCTIONS
    ═══════════════════════════════════════════════════════════ */
 const Utils = {
-  /** Generate a UUID-like unique id */
   uid() {
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 9);
   },
 
-  /** ISO timestamp string */
   now() {
     return new Date().toISOString();
   },
 
-  /** Format a date string for display */
   formatDate(iso) {
     if (!iso) return '';
     const d = new Date(iso);
@@ -75,7 +64,6 @@ const Utils = {
     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
   },
 
-  /** Format date for the editor modal header */
   formatDateLong(iso) {
     if (!iso) return '';
     return new Date(iso).toLocaleDateString('en-US', {
@@ -84,20 +72,17 @@ const Utils = {
     });
   },
 
-  /** Count words in a string */
   wordCount(text) {
     if (!text || !text.trim()) return 0;
     return text.trim().split(/\s+/).filter(w => w.length > 0).length;
   },
 
-  /** Strip HTML tags from contenteditable content */
   stripHtml(html) {
     const t = document.createElement('div');
     t.innerHTML = html;
     return t.textContent || t.innerText || '';
   },
 
-  /** Escape HTML for display */
   escapeHtml(str) {
     return String(str)
       .replace(/&/g, '&amp;')
@@ -106,7 +91,6 @@ const Utils = {
       .replace(/"/g, '&quot;');
   },
 
-  /** Highlight search matches in text */
   highlight(text, query) {
     if (!query || !query.trim()) return Utils.escapeHtml(text);
     const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -114,7 +98,6 @@ const Utils = {
     return Utils.escapeHtml(text).replace(regex, '<mark class="search-highlight">$1</mark>');
   },
 
-  /** Debounce utility */
   debounce(fn, delay) {
     let timer;
     return (...args) => {
@@ -123,18 +106,50 @@ const Utils = {
     };
   },
 
-  /** Clamp a number between min and max */
   clamp(n, min, max) { return Math.min(Math.max(n, min), max); },
 
-  /** Deep clone an object */
   clone(obj) { return JSON.parse(JSON.stringify(obj)); },
+
+  calculateStreak(notes) {
+    const activeNotes = notes.filter(n => !n.deletedAt);
+    if (!activeNotes.length) return 0;
+
+    const uniqueDates = new Set(activeNotes.map(n => new Date(n.createdAt).toLocaleDateString('en-CA')));
+    let streak = 0;
+    
+    let d = new Date();
+    let todayKey = d.toLocaleDateString('en-CA');
+    d.setDate(d.getDate() - 1);
+    let yesterdayKey = d.toLocaleDateString('en-CA');
+
+    d = new Date();
+    if (uniqueDates.has(todayKey)) {
+      streak = 1;
+      d.setDate(d.getDate() - 1);
+    } else if (uniqueDates.has(yesterdayKey)) {
+      streak = 1;
+      d.setDate(d.getDate() - 2);
+    } else {
+      return 0; 
+    }
+
+    while (true) {
+      let key = d.toLocaleDateString('en-CA');
+      if (uniqueDates.has(key)) {
+        streak++;
+        d.setDate(d.getDate() - 1);
+      } else {
+        break;
+      }
+    }
+    return streak;
+  },
 };
 
 /* ═══════════════════════════════════════════════════════════
    3. LOCAL STORAGE SERVICE
    ═══════════════════════════════════════════════════════════ */
 const StorageService = {
-  /** Load all notes from localStorage */
   load() {
     try {
       const raw = localStorage.getItem(APP_CONFIG.LOCAL_STORAGE_KEY);
@@ -145,7 +160,6 @@ const StorageService = {
     }
   },
 
-  /** Persist all notes to localStorage */
   save(notes) {
     try {
       localStorage.setItem(APP_CONFIG.LOCAL_STORAGE_KEY, JSON.stringify(notes));
@@ -154,7 +168,6 @@ const StorageService = {
     }
   },
 
-  /** Merge remote notes with local notes, preferring newer updatedAt */
   merge(localNotes, remoteNotes) {
     const map = new Map();
     localNotes.forEach(n => map.set(n.id, n));
@@ -167,12 +180,10 @@ const StorageService = {
     return Array.from(map.values());
   },
 
-  /** Load theme preference */
   loadTheme() {
     return localStorage.getItem(APP_CONFIG.THEME_KEY) || 'auto';
   },
 
-  /** Save theme preference */
   saveTheme(theme) {
     localStorage.setItem(APP_CONFIG.THEME_KEY, theme);
   },
@@ -187,7 +198,6 @@ const FirebaseService = {
   _initialized: false,
   _unsubscribeSnapshot: null,
 
-  /** Initialize Firebase SDK (called once) */
   init() {
     if (this._initialized) return;
     try {
@@ -201,45 +211,37 @@ const FirebaseService = {
     }
   },
 
-  /** Auth state listener */
   onAuthStateChanged(callback) {
     if (!this._auth) return;
     this._auth.onAuthStateChanged(callback);
   },
 
-  /** Sign in with email + password */
   async signIn(email, password) {
     return this._auth.signInWithEmailAndPassword(email, password);
   },
 
-  /** Register new user */
   async signUp(email, password) {
     return this._auth.createUserWithEmailAndPassword(email, password);
   },
 
-  /** Sign out */
   async signOut() {
     if (this._unsubscribeSnapshot) this._unsubscribeSnapshot();
     return this._auth.signOut();
   },
 
-  /** Get current user */
   currentUser() {
     return this._auth ? this._auth.currentUser : null;
   },
 
-  /** Firestore collection reference for a user's notes */
   _notesRef(uid) {
     return this._db.collection('users').doc(uid).collection('notes');
   },
 
-  /** Fetch all notes once for a user */
   async fetchNotes(uid) {
     const snap = await this._notesRef(uid).get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
 
-  /** Real-time listener — calls callback(notes[]) on any change */
   subscribeNotes(uid, callback) {
     if (this._unsubscribeSnapshot) this._unsubscribeSnapshot();
     this._unsubscribeSnapshot = this._notesRef(uid)
@@ -251,7 +253,6 @@ const FirebaseService = {
       });
   },
 
-  /** Unsubscribe Firestore listener */
   unsubscribe() {
     if (this._unsubscribeSnapshot) {
       this._unsubscribeSnapshot();
@@ -259,18 +260,15 @@ const FirebaseService = {
     }
   },
 
-  /** Save (upsert) a note to Firestore */
   async saveNote(uid, note) {
     const { id, ...data } = note;
     await this._notesRef(uid).doc(id).set(data, { merge: true });
   },
 
-  /** Permanently delete a note from Firestore */
   async deleteNote(uid, noteId) {
     await this._notesRef(uid).doc(noteId).delete();
   },
 
-  /** Batch save multiple notes (for import) */
   async batchSave(uid, notes) {
     const batch = this._db.batch();
     const ref   = this._notesRef(uid);
@@ -286,10 +284,6 @@ const FirebaseService = {
    5. NOTE ENGINE — Note Lifecycle & Transformations
    ═══════════════════════════════════════════════════════════ */
 const NoteEngine = {
-  /**
-   * Create a brand new note object.
-   * @returns {Object} New note with default schema
-   */
   create(overrides = {}) {
     const now = Utils.now();
     const dateTitle = new Date().toLocaleDateString('en-US', {
@@ -299,6 +293,7 @@ const NoteEngine = {
       id:        Utils.uid(),
       title:     dateTitle,
       content:   '',
+      emotion:   '😐',
       pinned:    false,
       favorite:  false,
       createdAt: now,
@@ -308,26 +303,21 @@ const NoteEngine = {
     };
   },
 
-  /** Update a note's fields and bump updatedAt */
   update(note, changes) {
     return { ...note, ...changes, updatedAt: Utils.now() };
   },
 
-  /** Soft-delete: set deletedAt timestamp */
   trash(note) {
     return NoteEngine.update(note, { deletedAt: Utils.now(), pinned: false, favorite: false });
   },
 
-  /** Restore from trash: clear deletedAt */
   restore(note) {
     return NoteEngine.update(note, { deletedAt: null });
   },
 
-  /** Filter notes by current active filter + search query */
-  filter(notes, filterKey, searchQuery = '') {
+  filter(notes, filterKey, searchQuery = '', dateQuery = '') {
     let result = notes;
 
-    // Apply view filter
     switch (filterKey) {
       case FILTERS.PINNED:
         result = notes.filter(n => n.pinned && !n.deletedAt);
@@ -338,20 +328,28 @@ const NoteEngine = {
       case FILTERS.TRASH:
         result = notes.filter(n => !!n.deletedAt);
         break;
-      default: // ALL
+      case FILTERS.THIS_WEEK:
+        const oneWeekAgo = new Date();
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+        result = notes.filter(n => !n.deletedAt && new Date(n.createdAt) >= oneWeekAgo);
+        break;
+      case FILTERS.THIS_MONTH:
+        const firstDayOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+        result = notes.filter(n => !n.deletedAt && new Date(n.createdAt) >= firstDayOfMonth);
+        break;
+      default: // ALL and DATE fall here
         result = notes.filter(n => !n.deletedAt);
     }
 
-    // Apply search query
-    if (searchQuery && searchQuery.trim()) {
-      const q = searchQuery.toLowerCase().trim();
-      result = result.filter(n =>
-        n.title.toLowerCase().includes(q) ||
-        n.content.toLowerCase().includes(q)
-      );
+    if (dateQuery) {
+      result = result.filter(n => new Date(n.createdAt).toLocaleDateString('en-CA') === dateQuery);
     }
 
-    // Sort: pinned first (in non-trash views), then by updatedAt desc
+    if (searchQuery && searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      result = result.filter(n => n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q));
+    }
+
     if (filterKey !== FILTERS.TRASH) {
       result = [...result].sort((a, b) => {
         if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
@@ -364,7 +362,6 @@ const NoteEngine = {
     return result;
   },
 
-  /** Count notes for badge display */
   counts(notes) {
     const active = notes.filter(n => !n.deletedAt);
     return {
@@ -388,7 +385,6 @@ const ThemeController = {
     this._current = StorageService.loadTheme();
     this._apply();
 
-    // Listen for system theme changes when in auto mode
     this._mediaQuery.addEventListener('change', () => {
       if (this._current === 'auto') this._apply();
     });
@@ -399,7 +395,7 @@ const ThemeController = {
     this._current = isDark ? 'light' : 'dark';
     StorageService.saveTheme(this._current);
     this._apply();
-    return !isDark; // returns new isDark state
+    return !isDark;
   },
 
   _apply() {
@@ -443,7 +439,6 @@ const Toast = {
     `;
     this._container.appendChild(el);
 
-    // Auto-remove
     const remove = () => {
       el.classList.add('toast-exit');
       el.addEventListener('animationend', () => el.remove(), { once: true });
@@ -473,7 +468,6 @@ const ConfirmDialog = {
     this._dialog.querySelector('.confirm-backdrop').addEventListener('click', () => this._respond(false));
   },
 
-  /** Show dialog. Returns Promise<boolean> */
   show({ title = 'Are you sure?', message = '', icon = '⚠️', okLabel = 'Confirm', cancelLabel = 'Cancel' }) {
     this._dialog.querySelector('.confirm-icon').textContent    = icon;
     this._dialog.querySelector('.confirm-title').textContent   = title;
@@ -504,10 +498,11 @@ const EditorController = {
   _btnPin:        null,
   _btnFav:        null,
   _btnTrash:      null,
+  _emoBtns:       null,
   _currentNote:   null,
   _saveTimer:     null,
-  _onSave:        null,  // callback(updatedNote)
-  _onTrash:       null,  // callback(noteId)
+  _onSave:        null,
+  _onTrash:       null,
   _isTrashView:   false,
 
   init(onSave, onTrash) {
@@ -524,27 +519,19 @@ const EditorController = {
     this._btnFav        = document.getElementById('modal-btn-fav');
     this._btnTrash      = document.getElementById('modal-btn-trash');
 
-    // Close button
     document.getElementById('btn-close-modal').addEventListener('click', () => this.close());
-
-    // Backdrop click to close
     this._modal.querySelector('.modal-backdrop').addEventListener('click', () => this.close());
 
-    // Keyboard shortcut: Escape to close
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape' && this._modal.classList.contains('open')) this.close();
     });
 
-    // Auto-save on title input
     this._titleInput.addEventListener('input', () => this._scheduleSave());
-
-    // Auto-save on content input + word count update
     this._contentEl.addEventListener('input', () => {
       this._updateWordCount();
       this._scheduleSave();
     });
 
-    // Pin toggle
     this._btnPin.addEventListener('click', () => {
       if (!this._currentNote || this._isTrashView) return;
       this._currentNote.pinned = !this._currentNote.pinned;
@@ -553,7 +540,6 @@ const EditorController = {
       this._triggerSave();
     });
 
-    // Favorite toggle
     this._btnFav.addEventListener('click', () => {
       if (!this._currentNote || this._isTrashView) return;
       this._currentNote.favorite = !this._currentNote.favorite;
@@ -562,7 +548,6 @@ const EditorController = {
       this._triggerSave();
     });
 
-    // Trash button
     this._btnTrash.addEventListener('click', async () => {
       if (!this._currentNote) return;
       const confirmed = await ConfirmDialog.show({
@@ -576,24 +561,31 @@ const EditorController = {
         if (this._onTrash) this._onTrash(this._currentNote.id);
       }
     });
+
+    this._emoBtns = document.querySelectorAll('.emo-btn');
+    this._emoBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (!this._currentNote || this._isTrashView) return;
+        this._emoBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        this._currentNote.emotion = btn.dataset.emo;
+        this._triggerSave();
+      });
+    });
   },
 
-  /** Open the editor with a given note */
   open(note, isTrashView = false) {
     this._currentNote = Utils.clone(note);
     this._isTrashView = isTrashView;
 
-    // Populate fields
     this._titleInput.value = note.title || '';
     this._contentEl.innerHTML = note.content || '';
     this._dateDisplay.textContent = Utils.formatDateLong(note.createdAt);
 
-    // Update UI state
     this._updateWordCount();
     this._updatePinFavButtons();
     this._setSaveState('idle');
 
-    // Disable editing for trash items
     const editable = !isTrashView;
     this._titleInput.disabled       = !editable;
     this._contentEl.contentEditable = editable ? 'true' : 'false';
@@ -602,15 +594,18 @@ const EditorController = {
     this._btnTrash.style.display    = isTrashView ? 'none' : '';
     this._contentEl.dataset.placeholder = editable ? 'Write down your entry...' : '';
 
-    // Open modal
+    const noteEmo = note.emotion || '😐';
+    this._emoBtns.forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.emo === noteEmo);
+      btn.style.pointerEvents = isTrashView ? 'none' : 'all';
+    });
+
     this._modal.classList.add('open');
     document.body.style.overflow = 'hidden';
 
-    // Hide FAB on mobile when editor is open
     const fab = document.getElementById('fab-new-note');
     if (fab) fab.classList.add('hidden');
 
-    // Focus title (only if editable and title is default/empty)
     if (editable) {
       setTimeout(() => {
         if (!note.content) {
@@ -622,9 +617,7 @@ const EditorController = {
     }
   },
 
-  /** Close the editor modal */
   close() {
-    // Flush any pending save
     if (this._saveTimer) {
       clearTimeout(this._saveTimer);
       this._saveTimer = null;
@@ -634,21 +627,18 @@ const EditorController = {
     this._modal.classList.remove('open');
     document.body.style.overflow = '';
 
-    // Restore FAB
     const fab = document.getElementById('fab-new-note');
     if (fab) fab.classList.remove('hidden');
 
     this._currentNote = null;
   },
 
-  /** Schedule a debounced auto-save */
   _scheduleSave() {
     this._setSaveState('saving');
     clearTimeout(this._saveTimer);
     this._saveTimer = setTimeout(() => this._triggerSave(), APP_CONFIG.AUTOSAVE_DELAY);
   },
 
-  /** Immediately collect editor state and invoke save callback */
   _triggerSave(silent = false) {
     if (!this._currentNote || this._isTrashView) return;
 
@@ -661,12 +651,10 @@ const EditorController = {
     if (this._onSave) this._onSave(Utils.clone(this._currentNote));
     if (!silent) this._setSaveState('saved');
 
-    // Reset to idle after 2 seconds
     clearTimeout(this._idleTimer);
     this._idleTimer = setTimeout(() => this._setSaveState('idle'), 2000);
   },
 
-  /** Update the save indicator chip */
   _setSaveState(state) {
     const el = this._saveIndicator;
     el.classList.remove('saving', 'saved', 'idle');
@@ -681,7 +669,6 @@ const EditorController = {
     }
   },
 
-  /** Update word count footer display */
   _updateWordCount() {
     const text  = Utils.stripHtml(this._contentEl.innerHTML);
     const words = Utils.wordCount(text);
@@ -689,7 +676,6 @@ const EditorController = {
     this._wordCounter.textContent = `${words} word${words !== 1 ? 's' : ''} · ${chars} char${chars !== 1 ? 's' : ''}`;
   },
 
-  /** Sync pin/fav button visual states */
   _updatePinFavButtons() {
     if (!this._currentNote) return;
     this._btnPin.classList.toggle('pinned',    !!this._currentNote.pinned);
@@ -711,15 +697,12 @@ const UIController = {
     this._contextTitle = document.getElementById('context-title');
   },
 
-  /** Render the full notes grid */
   renderNotes(notes, filterKey, searchQuery = '') {
     this._notesFeed.innerHTML = '';
 
-    // Update context title
-    const titles = { all: 'All Notes', pinned: 'Pinned', favorites: 'Favorites', trash: 'Trash' };
+    const titles = { all: 'All Notes', pinned: 'Pinned', favorites: 'Favorites', trash: 'Trash', 'this-week': 'This Week', 'this-month': 'This Month', date: 'Selected Date' };
     if (this._contextTitle) this._contextTitle.textContent = titles[filterKey] || 'All Notes';
 
-    // Trash controls bar
     if (filterKey === FILTERS.TRASH) {
       const bar = document.createElement('div');
       bar.className = 'trash-controls';
@@ -732,13 +715,13 @@ const UIController = {
       this._notesFeed.appendChild(bar);
     }
 
-    // Empty state
     if (notes.length === 0) {
       const emptyMsgs = {
         all:       { icon: '📔', title: 'Your diary is empty', sub: 'Tap the + button to write your first entry.' },
         pinned:    { icon: '📌', title: 'No pinned notes',     sub: 'Pin important notes to find them quickly.' },
         favorites: { icon: '❤️', title: 'No favorites yet',    sub: 'Mark notes as favorites to see them here.' },
         trash:     { icon: '🗑️', title: 'Trash is empty',      sub: 'Deleted notes will appear here.' },
+        date:      { icon: '📅', title: 'No entries this day', sub: 'Try selecting a different date.' },
       };
       const msg = emptyMsgs[filterKey] || emptyMsgs.all;
       this._notesFeed.innerHTML += `
@@ -751,7 +734,6 @@ const UIController = {
       return;
     }
 
-    // Notes grid
     const grid = document.createElement('div');
     grid.className = 'notes-grid';
 
@@ -763,27 +745,22 @@ const UIController = {
     this._notesFeed.appendChild(grid);
   },
 
-  /** Build a single note card element */
   _buildNoteCard(note, filterKey, searchQuery, index) {
     const card = document.createElement('div');
     card.className = `note-card${note.deletedAt ? ' in-trash' : ''}`;
     card.dataset.noteId = note.id;
     card.style.animationDelay = `${Utils.clamp(index * 40, 0, 400)}ms`;
 
-    // Highlighted content for search
     const titleHtml   = Utils.highlight(note.title || 'Untitled', searchQuery);
     const previewText = Utils.stripHtml(note.content || '').slice(0, 200);
     const bodyHtml    = Utils.highlight(previewText, searchQuery);
 
-    // Badges
     let badgesHtml = '';
     if (note.pinned)   badgesHtml += `<span class="card-badge badge-pin">📌 Pinned</span>`;
     if (note.favorite) badgesHtml += `<span class="card-badge badge-fav">❤️ Favorite</span>`;
 
-    // Word count
     const words = Utils.wordCount(Utils.stripHtml(note.content || ''));
 
-    // Card action buttons (non-trash only)
     const actionsHtml = !note.deletedAt ? `
       <div class="card-actions">
         <button class="card-action-btn pin-btn${note.pinned ? ' pinned' : ''}" title="${note.pinned ? 'Unpin' : 'Pin'}">📌</button>
@@ -792,7 +769,6 @@ const UIController = {
       </div>
     ` : '';
 
-    // Trash action buttons
     const trashActionsHtml = note.deletedAt ? `
       <div class="trash-card-actions">
         <button class="trash-btn restore" data-id="${note.id}">↩️ Restore</button>
@@ -803,7 +779,7 @@ const UIController = {
     card.innerHTML = `
       ${actionsHtml}
       ${badgesHtml ? `<div class="card-badge-row">${badgesHtml}</div>` : ''}
-      <div class="card-title">${titleHtml}</div>
+      <div class="card-title"><span style="margin-right: 6px;">${note.emotion || '😐'}</span>${titleHtml}</div>
       <div class="card-body">${bodyHtml || '<span style="color:var(--text-tertiary);font-style:italic">No content yet...</span>'}</div>
       <div class="card-footer">
         <span class="card-date">${Utils.formatDate(note.updatedAt)}</span>
@@ -815,7 +791,6 @@ const UIController = {
     return card;
   },
 
-  /** Update badge counts in sidebar nav */
   updateBadges(counts) {
     const setBadge = (id, count) => {
       const el = document.getElementById(id);
@@ -830,14 +805,12 @@ const UIController = {
     setBadge('badge-trash',     counts.trash);
   },
 
-  /** Update active nav item highlight */
   setActiveNav(filterKey) {
     document.querySelectorAll('.nav-item').forEach(el => {
       el.classList.toggle('active', el.dataset.filter === filterKey);
     });
   },
 
-  /** Show/hide the loading overlay */
   setLoading(visible) {
     const overlay = document.getElementById('loading-overlay');
     if (visible) {
@@ -847,19 +820,16 @@ const UIController = {
     }
   },
 
-  /** Show the auth gate */
   showAuth() {
     const gate = document.getElementById('auth-gate');
     gate.classList.remove('hidden');
   },
 
-  /** Hide the auth gate */
   hideAuth() {
     const gate = document.getElementById('auth-gate');
     gate.classList.add('hidden');
   },
 
-  /** Update user strip in sidebar */
   updateUserStrip(user) {
     const strip = document.getElementById('user-strip');
     if (!strip) return;
@@ -873,7 +843,6 @@ const UIController = {
     }
   },
 
-  /** Toggle mobile sidebar drawer */
   toggleMobileSidebar(open) {
     const sidebar = document.getElementById('sidebar');
     const overlay = document.getElementById('mobile-overlay');
@@ -888,7 +857,6 @@ const UIController = {
    11. DATA BACKUP SERVICE — Export & Import
    ═══════════════════════════════════════════════════════════ */
 const BackupService = {
-  /** Export all notes as a JSON file download */
   export(notes) {
     const payload = {
       app:         'My Diary (TAKEN)',
@@ -911,10 +879,6 @@ const BackupService = {
     Toast.success(`Exported ${notes.length} notes successfully.`);
   },
 
-  /**
-   * Import notes from a JSON file.
-   * @returns {Promise<Array>} New notes to merge
-   */
   import(file) {
     return new Promise((resolve, reject) => {
       if (!file || file.type !== 'application/json') {
@@ -925,15 +889,14 @@ const BackupService = {
       reader.onload = (e) => {
         try {
           const data = JSON.parse(e.target.result);
-          // Validate structure
           const notes = Array.isArray(data) ? data : (data.notes || []);
           if (!Array.isArray(notes)) throw new Error('Invalid backup format.');
 
-          // Validate & sanitize each note
           const valid = notes.filter(n => n && typeof n === 'object' && n.id).map(n => ({
             id:        String(n.id),
             title:     String(n.title || 'Imported Note'),
             content:   String(n.content || ''),
+            emotion:   String(n.emotion || '😐'),
             pinned:    Boolean(n.pinned),
             favorite:  Boolean(n.favorite),
             createdAt: n.createdAt || Utils.now(),
@@ -956,41 +919,36 @@ const BackupService = {
    12. APP CONTROLLER — Main Orchestrator
    ═══════════════════════════════════════════════════════════ */
 const AppController = {
-  _notes:       [],        // Master note array (all notes including trash)
+  _notes:       [],
   _currentUser: null,
   _activeFilter: FILTERS.ALL,
   _searchQuery:  '',
+  _dateQuery:    '',
   _demoMode:     APP_CONFIG.DEMO_MODE,
 
-  /** Bootstrap the application */
   async init() {
     console.log('[App] Initializing My Diary (TAKEN)...');
 
-    // Initialize sub-systems
     ThemeController.init();
     Toast.init();
     ConfirmDialog.init();
     UIController.init();
 
-    // Initialize editor with save + trash callbacks
     EditorController.init(
       (updatedNote) => this._handleNoteSave(updatedNote),
       (noteId)      => this._handleNoteTrash(noteId)
     );
 
-    // Load notes from localStorage immediately
     this._notes = StorageService.load();
     this._renderCurrentView();
     UIController.setLoading(false);
 
-    // Check if demo mode (skip Firebase)
     if (this._demoMode) {
       UIController.hideAuth();
       this._bindUIEvents();
       return;
     }
 
-    // Initialize Firebase
     try {
       FirebaseService.init();
     } catch (e) {
@@ -1001,7 +959,6 @@ const AppController = {
       return;
     }
 
-    // Auth state change listener
     FirebaseService.onAuthStateChanged(user => {
       if (user) {
         this._onUserSignedIn(user);
@@ -1010,18 +967,15 @@ const AppController = {
       }
     });
 
-    // Bind all UI events
     this._bindUIEvents();
   },
 
-  /** Called when Firebase Auth resolves a signed-in user */
   async _onUserSignedIn(user) {
     console.log('[App] User signed in:', user.email);
     this._currentUser = user;
     UIController.hideAuth();
     UIController.updateUserStrip(user);
 
-    // Subscribe to real-time Firestore updates
     FirebaseService.subscribeNotes(user.uid, (remoteNotes) => {
       console.log('[App] Firestore sync: received', remoteNotes.length, 'notes');
       this._notes = StorageService.merge(this._notes, remoteNotes);
@@ -1030,7 +984,6 @@ const AppController = {
     });
   },
 
-  /** Called when user is not authenticated */
   _onUserSignedOut() {
     console.log('[App] User signed out.');
     this._currentUser = null;
@@ -1039,7 +992,6 @@ const AppController = {
     UIController.showAuth();
   },
 
-  /** Handle a note save from the editor */
   async _handleNoteSave(updatedNote) {
     const index = this._notes.findIndex(n => n.id === updatedNote.id);
     if (index >= 0) {
@@ -1048,11 +1000,9 @@ const AppController = {
       this._notes.unshift(updatedNote);
     }
 
-    // Persist locally
     StorageService.save(this._notes);
     this._renderCurrentView();
 
-    // Push to Firestore
     if (this._currentUser) {
       try {
         await FirebaseService.saveNote(this._currentUser.uid, updatedNote);
@@ -1063,7 +1013,6 @@ const AppController = {
     }
   },
 
-  /** Move a note to trash */
   async _handleNoteTrash(noteId) {
     const index = this._notes.findIndex(n => n.id === noteId);
     if (index < 0) return;
@@ -1082,7 +1031,6 @@ const AppController = {
     }
   },
 
-  /** Create a new note and open it in the editor */
   _createNote() {
     const note = NoteEngine.create();
     this._notes.unshift(note);
@@ -1090,13 +1038,11 @@ const AppController = {
     this._renderCurrentView();
     EditorController.open(note, false);
 
-    // Push skeleton to Firestore
     if (this._currentUser) {
       FirebaseService.saveNote(this._currentUser.uid, note).catch(console.warn);
     }
   },
 
-  /** Open an existing note in the editor */
   _openNote(noteId) {
     const note = this._notes.find(n => n.id === noteId);
     if (!note) return;
@@ -1104,7 +1050,6 @@ const AppController = {
     EditorController.open(note, isTrash);
   },
 
-  /** Toggle pin state for a note (from card button) */
   async _togglePin(noteId) {
     const index = this._notes.findIndex(n => n.id === noteId);
     if (index < 0) return;
@@ -1119,7 +1064,6 @@ const AppController = {
     }
   },
 
-  /** Toggle favorite state */
   async _toggleFavorite(noteId) {
     const index = this._notes.findIndex(n => n.id === noteId);
     if (index < 0) return;
@@ -1134,7 +1078,6 @@ const AppController = {
     }
   },
 
-  /** Restore a note from trash */
   async _restoreNote(noteId) {
     const index = this._notes.findIndex(n => n.id === noteId);
     if (index < 0) return;
@@ -1148,7 +1091,6 @@ const AppController = {
     }
   },
 
-  /** Permanently delete a note */
   async _purgeNote(noteId) {
     const confirmed = await ConfirmDialog.show({
       title:   'Permanently Delete?',
@@ -1168,7 +1110,6 @@ const AppController = {
     }
   },
 
-  /** Empty the entire trash */
   async _emptyTrash() {
     const trashNotes = this._notes.filter(n => !!n.deletedAt);
     if (trashNotes.length === 0) return;
@@ -1194,7 +1135,6 @@ const AppController = {
     }
   },
 
-  /** Switch active filter */
   _setFilter(filterKey) {
     this._activeFilter = filterKey;
     this._searchQuery  = '';
@@ -1203,24 +1143,31 @@ const AppController = {
     UIController.setActiveNav(filterKey);
     this._renderCurrentView();
 
-    // Close mobile sidebar
     if (window.innerWidth <= 768) UIController.toggleMobileSidebar(false);
   },
 
-  /** Render the notes grid for the current filter + search */
   _renderCurrentView() {
-    const filtered = NoteEngine.filter(this._notes, this._activeFilter, this._searchQuery);
+    const filtered = NoteEngine.filter(this._notes, this._activeFilter, this._searchQuery, this._dateQuery);
     const counts   = NoteEngine.counts(this._notes);
     UIController.renderNotes(filtered, this._activeFilter, this._searchQuery);
     UIController.updateBadges(counts);
     UIController.setActiveNav(this._activeFilter);
 
-    // Re-bind trash action buttons (they're re-created on each render)
+    // Update Dashboard Cards
+    const dashTotal = document.getElementById('dash-total-notes');
+    const dashStreak = document.getElementById('dash-streak');
+    if (dashTotal) dashTotal.textContent = counts.all;
+    if (dashStreak) dashStreak.textContent = Utils.calculateStreak(this._notes);
+
+    // Sync Quick Filter UI Active States
+    document.querySelectorAll('.qf-btn').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.filter === this._activeFilter);
+    });
+
     this._bindTrashCardButtons();
     this._bindEmptyTrashButton();
   },
 
-  /** Bind click events to trash action buttons inside rendered cards */
   _bindTrashCardButtons() {
     document.querySelectorAll('.trash-btn.restore').forEach(btn => {
       btn.addEventListener('click', (e) => {
@@ -1236,55 +1183,44 @@ const AppController = {
     });
   },
 
-  /** Bind empty trash button */
   _bindEmptyTrashButton() {
     const btn = document.getElementById('btn-empty-trash');
     if (btn) btn.addEventListener('click', () => this._emptyTrash());
   },
 
-  /** Bind all static UI event listeners */
   _bindUIEvents() {
-    /* ── Sidebar Nav Filters ── */
     document.querySelectorAll('.nav-item[data-filter]').forEach(item => {
       item.addEventListener('click', () => this._setFilter(item.dataset.filter));
     });
 
-    /* ── New Note Buttons ── */
     document.getElementById('btn-new-note').addEventListener('click', () => this._createNote());
     document.getElementById('fab-new-note').addEventListener('click', () => this._createNote());
 
-    /* ── Note Feed Click Delegation ── */
     document.getElementById('notes-feed').addEventListener('click', (e) => {
       const card = e.target.closest('.note-card');
       if (!card) return;
 
-      // Pin button
       if (e.target.closest('.pin-btn')) {
         e.stopPropagation();
         this._togglePin(card.dataset.noteId);
         return;
       }
-      // Fav button
       if (e.target.closest('.fav-btn')) {
         e.stopPropagation();
         this._toggleFavorite(card.dataset.noteId);
         return;
       }
-      // Trash button on card
       if (e.target.closest('.trash-btn-card')) {
         e.stopPropagation();
         this._handleNoteTrash(card.dataset.noteId);
         return;
       }
-      // Trash/Restore action buttons handled separately
       if (e.target.closest('.trash-card-actions')) return;
 
-      // Open note (not in trash)
       const note = this._notes.find(n => n.id === card.dataset.noteId);
       if (note && !note.deletedAt) this._openNote(card.dataset.noteId);
     });
 
-    /* ── Search ── */
     const searchInput  = document.getElementById('search-input');
     const searchClear  = document.getElementById('btn-search-clear');
 
@@ -1303,22 +1239,44 @@ const AppController = {
       this._renderCurrentView();
     });
 
-    /* ── Theme Toggle ── */
+    /* ── Dashboard Quick Filters ── */
+    document.querySelectorAll('.qf-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const cal = document.getElementById('calendar-filter');
+        if (btn.dataset.filter !== FILTERS.DATE && cal) {
+          cal.value = '';
+          this._dateQuery = '';
+        }
+        this._setFilter(btn.dataset.filter);
+      });
+    });
+
+    /* ── Calendar Date Picker ── */
+    const calendarInput = document.getElementById('calendar-filter');
+    if (calendarInput) {
+      calendarInput.addEventListener('change', (e) => {
+        if (e.target.value) {
+          this._dateQuery = e.target.value; 
+          this._setFilter(FILTERS.DATE);
+        } else {
+          this._dateQuery = '';
+          this._setFilter(FILTERS.ALL);
+        }
+      });
+    }
+
     document.getElementById('theme-toggle').addEventListener('click', () => {
       ThemeController.toggle();
     });
 
-    /* ── Hamburger (Mobile) ── */
     document.getElementById('btn-hamburger').addEventListener('click', () => {
       UIController.toggleMobileSidebar();
     });
 
-    /* ── Mobile Overlay ── */
     document.getElementById('mobile-overlay').addEventListener('click', () => {
       UIController.toggleMobileSidebar(false);
     });
 
-    /* ── Logout ── */
     document.getElementById('btn-logout').addEventListener('click', async () => {
       const confirmed = await ConfirmDialog.show({
         title:   'Sign Out?',
@@ -1333,12 +1291,10 @@ const AppController = {
       UIController.showAuth();
     });
 
-    /* ── Data Export ── */
     document.getElementById('btn-export').addEventListener('click', () => {
       BackupService.export(this._notes);
     });
 
-    /* ── Data Import ── */
     document.getElementById('btn-import').addEventListener('click', () => {
       document.getElementById('import-file-input').click();
     });
@@ -1349,13 +1305,11 @@ const AppController = {
 
       try {
         const imported = await BackupService.import(file);
-        // Merge: skip duplicates using StorageService.merge
         this._notes = StorageService.merge(this._notes, imported);
         StorageService.save(this._notes);
         this._renderCurrentView();
         Toast.success(`Imported ${imported.length} notes.`);
 
-        // Push to cloud
         if (this._currentUser) {
           FirebaseService.batchSave(this._currentUser.uid, imported).catch(console.warn);
         }
@@ -1363,15 +1317,12 @@ const AppController = {
         Toast.error(err.message || 'Import failed.');
       }
 
-      // Reset file input
       e.target.value = '';
     });
 
-    /* ── Auth Form ── */
     this._bindAuthForm();
   },
 
-  /** Bind auth form submission and toggle (sign in / sign up) */
   _bindAuthForm() {
     const form       = document.getElementById('auth-form');
     const emailInput = document.getElementById('auth-email');
@@ -1394,7 +1345,6 @@ const AppController = {
       passInput.disabled  = loading;
     };
 
-    // Toggle between Sign In / Sign Up
     toggleBtn.addEventListener('click', () => {
       isSignUp = !isSignUp;
       titleEl.textContent    = isSignUp ? 'Create Account' : 'Welcome Back';
@@ -1412,7 +1362,6 @@ const AppController = {
 
       setError('');
 
-      // Basic validation
       if (!email)    { setError('Please enter your email address.'); return; }
       if (!password) { setError('Please enter your password.'); return; }
       if (password.length < 6) { setError('Password must be at least 6 characters.'); return; }
@@ -1421,7 +1370,6 @@ const AppController = {
 
       try {
         if (this._demoMode) {
-          // Demo mode: skip Firebase
           setTimeout(() => {
             setLoading(false);
             UIController.hideAuth();
@@ -1437,7 +1385,6 @@ const AppController = {
         }
 
         Toast.success(isSignUp ? '🎉 Account created! Welcome to My Diary.' : '👋 Welcome back!');
-        // Auth state change will handle the rest
       } catch (err) {
         setLoading(false);
         const msg = this._parseAuthError(err.code || err.message);
@@ -1446,7 +1393,6 @@ const AppController = {
     });
   },
 
-  /** Parse Firebase auth error codes into human-friendly messages */
   _parseAuthError(code) {
     const messages = {
       'auth/invalid-email':            'Please enter a valid email address.',
